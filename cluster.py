@@ -1,6 +1,8 @@
 import trio
 import struct
-import json
+import random
+import msgpack
+
 
 DEFAULT_PORT = 14500
 
@@ -16,10 +18,10 @@ class CommonMessageChannel:
         await self.bytes_stream.aclose()
 
     def dumps(self, obj):
-        return json.dumps(obj).encode("utf-8")
+        return msgpack.dumps(obj)
 
     def loads(self, obj_bytes):
-        return json.loads(obj_bytes.decode("utf-8"))
+        return msgpack.loads(obj_bytes)
 
 
 class SendMessageChannel(CommonMessageChannel, trio.abc.SendChannel):
@@ -36,33 +38,46 @@ class SendMessageChannel(CommonMessageChannel, trio.abc.SendChannel):
 
 class ReceiveMessageChannel(CommonMessageChannel, trio.abc.ReceiveChannel):
     async def receive(self):
-        header = await self._receive_some_bytes(self.HEADER_LENGTH) # First few bytes are the header which denote the object length.
+        header = await self._receive_all_the_bytes(self.HEADER_LENGTH) # First few bytes are the header which denote the object length.
         (bytes_length,) = struct.unpack(self.HEADER_FORMAT, header)
-        obj_bytes = await self._receive_some_bytes(bytes_length)
+        obj_bytes = await self._receive_all_the_bytes(bytes_length)
         obj = self.loads(obj_bytes)
         return obj
 
-    async def _receive_some_bytes(self, bytes_length):
-        data = await self.bytes_stream.receive_some(bytes_length)
-        if not data: # The stream has been closed
-            raise trio.EndOfChannel
-        return data
+    async def _receive_all_the_bytes(self, bytes_length):
+        buffer = bytearray()
+        while True:
+            remaining_bytes = bytes_length - len(buffer)
+            if remaining_bytes == 0:
+                break
+            data = await self.bytes_stream.receive_some(remaining_bytes)
+            if not data: # The stream has been closed
+                raise trio.EndOfChannel
+            buffer += data
+        return buffer
+
+class MessageChannel(SendMessageChannel, ReceiveMessageChannel, trio.abc.Channel):
+    pass
 
 
 class Node:
     def __init__(self, host, port=DEFAULT_PORT):
         self.host = host
         self.port = port
-        self.channel = None
-        self.lock = trio.Lock()
+        self.channel = None # Will be set once connected
 
     def __str__(self):
         return str((self.host, self.port))
+
+    def __hash__(self):
+        return hash((self.host, self.port))
 
     def connected(self):
         return bool(self.channel)
 
     async def send(self, obj):
+        if not self.connected():
+            raise trio.ClosedResourceError
         try:
             await self.channel.send(obj)
             return True
@@ -71,29 +86,56 @@ class Node:
             self.channel = None
             return False
 
+    async def receive(self):
+        if not self.connected():
+            raise trio.ClosedResourceError
+        try:
+            return await self.channel.receive()
+        except trio.EndOfChannel:
+            await self.channel.aclose()
+            self.channel = None
+            raise
+
 
 class UnableToSend(Exception):
     pass
 
 
 class Cluster:
-    def __init__(self, initial_nodes=set(), *, cookie, network_timeout=5, autodiscover_period=60):
+    """
+    Class that handles:
+    * Server that listens for new TCP/IP connections on a port.
+    * Defines a simple protocol for initial handshake using a secret cookie and then sending/receiving objects over the connection.
+    * Client that connects to other servers (presumably other Cluster instances), called nodes here, and speaks the same protocol.
+    * Nodes are tracked in self.nodes.
+    * Messages can be sent to individual nodes or broadcast to all nodes.
+    * Objects received from nodes, either as a client or server are pushed into the self.messages channel.
+
+
+    Usage:
+    cluster = Cluster(nodes=[Node("localhost", 8000), Node("localhost", 8001), ...])
+    # Do each of these in a backround task:
+    await cluster.listen() # Start the server, runs indefinitely.
+    await cluster.connect() # Connect to the other nodes, runs indefinitely to re-connect as needed.
+    async for message in cluster.messages:
+        # Do something with message.
+    """
+    def __init__(self, nodes=set(), *, cookie, network_timeout=5):
         """
         Args:
             cookie (bytestring): An identifier for nodes to share with each other as part
                 of negotiating their connection to the cluster. All servers must use the same
                 cookie to be part of the cluster. Provides some very very minimal amount of security.
 
-            network_timeout: The amount of time to expect typical network operations to complete in.
-
-            autodiscover_period: Approximately how often (in seconds) to re-discover and connect to nodes
-                in the cluster.
+            network_timeout: The amount of time in seconds to expect network operations to complete in.
+                Set this lower for quicker reaction network partitions, killed servers, etc... Set this
+                higher to avoid over-reacting to slow networks or busy servers.
         """
-        self.nodes = set(initial_nodes)
+        self.nodes = set(nodes)
+        self.clients = set()
         self._messages, self.messages = trio.open_memory_channel(0)
         self.cookie = cookie
         self.network_timeout = network_timeout
-        self.autodiscover_period = autodiscover_period
 
         self._listening = False
 
@@ -102,7 +144,7 @@ class Cluster:
             raise Exception("Already listening.")
         self._listening = True
 
-        print(f"Listening on port {port}")
+        print(f"Listening on port {port} for other nodes.")
         await trio.serve_tcp(self._handle_client, port, host=bind)
         self._listening = False
 
@@ -124,13 +166,19 @@ class Cluster:
             await stream.aclose()
             return
         await stream.send_all(bytes(reversed(self.cookie))) # Sending our cookie back for the client to know we've accepted.
+
         print(f"Successfull connection from {peer}.")
 
-        async for obj in ReceiveMessageChannel(stream):
-            await self._messages.send(obj)
-        print("Connection closed!")
+        node = Node(*peer)
+        node.channel = MessageChannel(stream)
+        self.clients.add(node)
 
-    async def connect_to_node(self, node):
+        async for obj in node.channel:
+            await self._messages.send(obj)
+        self.clients.remove(node)
+        print(f"Connection from node {peer} closed.")
+
+    async def _connect_to_node(self, node):
         """
         Try and connect to the node.
             1. No-op if already connected.
@@ -145,55 +193,57 @@ class Cluster:
             True, if the connection was successful, otherwise False.
         """
 
-        async with node.lock:
-            if node.channel:
-                return True
-            print(f"Connecting to node {node}")
-            try:
-                node.stream = await trio.open_tcp_stream(node.host, node.port)
-            except OSError:
-                print(f"Error: failed to find node {node}")
-                return False
-            await node.stream.send_all(self.cookie)
-            try:
-                with trio.fail_after(self.network_timeout): # Server must give us a cookie within a reasonable amount of time
-                    provided_cookie_response = await node.stream.receive_some(len(self.cookie))
-            except trio.TooSlowError:
-                print("Error: Server didn't send us back a cookie in time. Is our cookie correct?")
-                await node.stream.aclose()
-                node.stream = None
-                return False
-            expected_cookie_response = bytes(reversed(self.cookie))
-            if not expected_cookie_response:
-                print("Error: Server closed the connection on us. Is our cookie correct?")
-            if provided_cookie_response != expected_cookie_response:
-                print(f"Error: incorrect cookie response provided by server. Closing connection. (theirs: {provided_cookie_response}, ours: {expected_cookie_response})")
-                await node.stream.aclose()
-                node.stream = None
-                return False
+        if node.channel:
+            return
+        print(f"Connecting to node {node}")
+        try:
+            stream = await trio.open_tcp_stream(node.host, node.port)
+        except OSError:
+            print(f"Error: failed to find node {node}")
+            return
+        await stream.send_all(self.cookie)
+        try:
+            with trio.fail_after(self.network_timeout): # Server must give us a cookie within a reasonable amount of time
+                provided_cookie_response = await stream.receive_some(len(self.cookie))
+        except trio.TooSlowError:
+            print("Error: Server didn't send us back a cookie in time. Is our cookie correct?")
+            await stream.aclose()
+            return
+        expected_cookie_response = bytes(reversed(self.cookie))
+        if not expected_cookie_response:
+            print("Error: Server closed the connection on us. Is our cookie correct?")
+        if provided_cookie_response != expected_cookie_response:
+            print(f"Error: incorrect cookie response provided by server. Closing connection. (theirs: {provided_cookie_response}, ours: {expected_cookie_response})")
+            await stream.aclose()
+            return
 
-            node.channel = SendMessageChannel(node.stream)
+        node.channel = MessageChannel(stream)
 
-            print(f"Successfully connected to node {node}")
-            return True
+        print(f"Successfully connected to node {node}")
+
+        async for obj in node.channel:
+            await self._messages.send(obj)
+        node.channel = None
+        print(f"Connection to node {node} closed.")
+
+        return
 
     async def discover(self):
         return
 
     async def connect(self):
         """
-        Connect to all the nodes, maintain a connection, and periodically re-discover to find new nodes.
+        Connect to all the nodes and maintain a connection.
         """
-        print("Connecting to cluster.")
-        while True:
-            await self.discover()
-            async with trio.open_nursery() as nursery:
-                with trio.move_on_after(self.autodiscover_period):
-                    for node in self.nodes:
-                        if not node.connected():
-                            nursery.start_soon(self.connect_to_node, node)
-            await trio.sleep(self.autodiscover_period)
-            print("Re-discovering cluster.")
+        print("Connecting to other nodes.")
+        async with trio.open_nursery() as nursery:
+            while True:
+                for node in self.nodes:
+                    if not node.connected():
+                        nursery.start_soon(self._connect_to_node, node)
+
+                jitter = random.uniform(0, self.network_timeout / 2)
+                await trio.sleep(self.network_timeout + jitter)
 
     async def broadcast(self, obj):
         results = set()
@@ -214,11 +264,9 @@ class Cluster:
             results.add(node)
 
     async def send(self, node, obj):
-        connected_now = await self.connect_to_node(node) # Try and connect if we're not already
-        if connected_now:
+        if node.connected():
             success = await node.send(obj)
             if not success:
                 raise UnableToSend("Unable to send: connection to node lost.")
         else:
             raise UnableToSend("Unable to send: not connected to node.")
-
