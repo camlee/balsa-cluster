@@ -12,6 +12,7 @@ secret_cluster_cookie = b"abc123"
 
 async def main():
     cluster = GossipCluster(
+        name=sys.argv[1],
         bind=("0.0.0.0", int(sys.argv[1])), cookie=secret_cluster_cookie,
         servers=[
             Connection("localhost", 90001),
@@ -26,8 +27,8 @@ async def main():
         while True:
             sleep_time = random.randint(10, 30)
             await trio.sleep(sleep_time)
-            received = await cluster.broadcast({"type": "hello", "sleep_time": sleep_time})
-            print(f"Broadcast to {len(received)}/{len(cluster.servers) + len(cluster.clients)}.")
+            # received = await cluster.broadcast({"type": "hello", "sleep_time": sleep_time})
+            # print(f"Broadcast to {len(received)}/{len(cluster.servers) + len(cluster.clients)}.")
             # if not nodes_received:
             #     print("Warning: didn't broadcast to any nodes.")
             # elif nodes_received != cluster.nodes:
@@ -36,4 +37,7 @@ async def main():
     async def handle_hello(self):
         pass
 
-trio.run(main)
+try:
+    trio.run(main)
+except KeyboardInterrupt:
+    print("\nShutdown complete.\n")

@@ -31,7 +31,7 @@ class DispatchCluster(Cluster):
                     for method in methods:
                         nursery.start_soon(method, message)
             else:
-                print(f"No handler for message {message.obj} from {message.connection}.")
+                print(f"Warning: no handler for message {message.obj} from {message.connection}.")
 
     async def run(self):
         async with trio.open_nursery() as nursery:

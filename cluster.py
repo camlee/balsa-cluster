@@ -86,6 +86,9 @@ class Connection:
             await self.channel.aclose()
             self.channel = None
             return False
+        except trio.ClosedResourceError:
+            self.channel = None
+            return False
 
     async def receive(self):
         if not self.connected():
@@ -147,8 +150,8 @@ class Cluster(BaseCluster):
                 of negotiating their connection. All nodes must use the same
                 cookie to be part of the cluster. Provides some very very minimal amount of security.
 
-            network_timeout: The amount of time in seconds to expect network operations to complete in.
-                Set this lower for quicker reaction network partitions, killed servers, etc... Set this
+            network_timeout: The amount of time in seconds to expect network operations to complete in before giving up on them.
+                Set this lower for quicker reaction to network partitions, killed servers, etc... Set this
                 higher to avoid over-reacting to slow networks or busy servers.
         """
         self.bind = bind
@@ -185,7 +188,7 @@ class Cluster(BaseCluster):
         only in predictable network conditions.
 
         """
-        await trio.sleep(random.uniform(duration-duration/4, duration+duration/4))
+        await trio.sleep(random.uniform(duration-duration/5, duration+duration/5))
 
     async def listen(self):
         if self._listening:
@@ -201,7 +204,7 @@ class Cluster(BaseCluster):
 
     async def _handle_client(self, stream):
         peer = stream.socket.getpeername()
-        print(f"New connection attempt from {peer}.")
+        # print(f"New connection attempt from {peer}.")
         try:
             with trio.fail_after(self.network_timeout): # Client must give us a cookie within a reasonable amount of time
                 provided_cookie = await stream.receive_some(len(self.cookie))
@@ -218,7 +221,7 @@ class Cluster(BaseCluster):
             return
         await stream.send_all(bytes(reversed(self.cookie))) # Sending our cookie back for the client to know we've accepted.
 
-        print(f"Successfull connection from {peer}.")
+        # print(f"Successfull connection from {peer}.")
 
         client = Connection(*peer, direction="inbound")
         client.channel = MessageChannel(stream)
@@ -254,21 +257,26 @@ class Cluster(BaseCluster):
         if server.channel:
             return
 
-        print(f"Connecting to server {server}")
+        # print(f"Connecting to server {server}")
         server.direction = "outbound"
         try:
             stream = await trio.open_tcp_stream(server.host, server.port)
         except OSError:
             print(f"Error: failed to find server {server}")
             return
-        await stream.send_all(self.cookie)
         try:
+            await stream.send_all(self.cookie)
             with trio.fail_after(self.network_timeout): # Server must give us a cookie within a reasonable amount of time
                 provided_cookie_response = await stream.receive_some(len(self.cookie))
         except trio.TooSlowError:
             print("Error: Server didn't send us back a cookie in time. Is our cookie correct?")
             await stream.aclose()
             return
+        except trio.BrokenResourceError:
+            print(f"Connection to server {server} closed unexpectedly.")
+            await stream.aclose()
+            return
+
         expected_cookie_response = bytes(reversed(self.cookie))
         if not expected_cookie_response:
             print("Error: Server closed the connection on us. Is our cookie correct?")
@@ -279,7 +287,7 @@ class Cluster(BaseCluster):
 
         server.channel = MessageChannel(stream)
 
-        print(f"Successfully connected to server {server}")
+        # print(f"Successfully connected to server {server}")
         self._notify_server_change(server)
 
         try:
@@ -295,7 +303,7 @@ class Cluster(BaseCluster):
         """
         Connect to all the servers and maintain a connection.
         """
-        print("Connecting to other servers.")
+        # print("Connecting to other servers.")
         async with trio.open_nursery() as nursery:
             while True:
                 for server in self.servers:
@@ -316,7 +324,7 @@ class Cluster(BaseCluster):
         try:
             await self.send(connection, obj)
         except UnableToSend as e:
-            print(f"Error: {e}")
+            # print(f"Error: {e}")
 
             pass # Network partitions happen. If we can't send, that's reality and we just need to communicate it.
         else:
